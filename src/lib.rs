@@ -34,7 +34,9 @@ pub use coin::Coin;
 pub use coin::Fee;
 pub use mnemonic::Mnemonic;
 pub use msg::Msg;
+#[cfg(feature = "ethermint")]
+pub use private_key::EthermintPrivateKey;
 pub use private_key::MessageArgs;
-pub use private_key::PrivateKey;
+pub use private_key::{CosmosPrivateKey, PrivateKey};
 pub use public_key::PublicKey;
 pub use signature::Signature;

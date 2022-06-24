@@ -1,6 +1,6 @@
 use crate::mnemonic::Mnemonic;
 use crate::msg::Msg;
-use crate::public_key::PublicKey;
+use crate::public_key::{CosmosPublicKey, PublicKey};
 use crate::utils::bytes_to_hex_str;
 use crate::utils::encode_any;
 use crate::utils::hex_str_to_bytes;
@@ -15,13 +15,22 @@ use num_bigint::BigUint;
 use prost::Message;
 use secp256k1::constants::CURVE_ORDER as CurveN;
 use secp256k1::Message as CurveMessage;
-use secp256k1::Secp256k1;
+use secp256k1::{All, Secp256k1};
 use secp256k1::{PublicKey as PublicKeyEC, SecretKey};
 use sha2::Sha512;
 use sha2::{Digest, Sha256};
+use std::cell::RefCell;
 use std::str::FromStr;
 
+#[cfg(feature = "ethermint")]
+use cosmos_sdk_proto::ethermint::crypto::v1::ethsecp256k1::PubKey as ProtoEthSecp256k1Pubkey;
+
+thread_local! {
+    pub(crate) static SECP256K1: RefCell<Secp256k1<All>> = RefCell::new(Secp256k1::new());
+}
+
 pub const DEFAULT_COSMOS_HD_PATH: &str = "m/44'/118'/0'/0/0";
+pub const DEFAULT_ETHEREUM_HD_PATH: &str = "m/44'/60'/0'/0/0";
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct MessageArgs {
@@ -40,36 +49,50 @@ struct TxParts {
     signatures: Vec<Vec<u8>>,
 }
 
+pub trait PrivateKey: Clone + Sized {
+    fn from_secret(secret: &[u8]) -> Self
+    where
+        Self: Sized;
+
+    fn from_phrase(phrase: &str, passphrase: &str) -> Result<Self, PrivateKeyError>
+    where
+        Self: Sized;
+
+    fn from_hd_wallet_path(
+        path: &str,
+        phrase: &str,
+        passphrase: &str,
+    ) -> Result<Self, PrivateKeyError>
+    where
+        Self: Sized;
+
+    fn to_address(&self, prefix: &str) -> Result<Address, PrivateKeyError>;
+
+    fn get_signed_tx(
+        &self,
+        messages: &[Msg],
+        args: MessageArgs,
+        memo: &str,
+    ) -> Result<Tx, PrivateKeyError>;
+
+    fn sign_std_msg(
+        &self,
+        messages: &[Msg],
+        args: MessageArgs,
+        memo: &str,
+    ) -> Result<Vec<u8>, PrivateKeyError>;
+}
+
 /// This structure represents a private key of a Cosmos Network.
 #[derive(Debug, Eq, PartialEq, Copy, Clone, Hash)]
-pub struct PrivateKey([u8; 32]);
+pub struct CosmosPrivateKey([u8; 32]);
 
-impl PrivateKey {
+impl PrivateKey for CosmosPrivateKey {
     /// Create a private key using an arbitrary slice of bytes. This function is not resistant to side
     /// channel attacks and may reveal your secret and private key. It is on the other hand more compact
     /// than the bip32+bip39 logic.
-    pub fn from_secret(secret: &[u8]) -> PrivateKey {
-        let sec_hash = Sha256::digest(secret);
-
-        let mut i = BigUint::from_bytes_be(&sec_hash);
-
-        // Parameters of the curve as explained in https://en.bitcoin.it/wiki/Secp256k1
-        let mut n = BigUint::from_bytes_be(&CurveN);
-        n -= 1u64;
-
-        i %= n;
-        i += 1u64;
-
-        let mut result: [u8; 32] = Default::default();
-        let mut i_bytes = i.to_bytes_be();
-        // key has leading or trailing zero that's not displayed
-        // by default since this is a big int library missing a defined
-        // integer width.
-        while i_bytes.len() < 32 {
-            i_bytes.push(0);
-        }
-        result.copy_from_slice(&i_bytes);
-        PrivateKey(result)
+    fn from_secret(secret: &[u8]) -> CosmosPrivateKey {
+        CosmosPrivateKey(from_secret(secret))
     }
 
     /// This function will take the key_import phrase provided by CosmosCLI
@@ -81,150 +104,42 @@ impl PrivateKey {
     /// the potential key space. This function returns m/44'/118'/0'/0/0 because
     /// that's going to be the key you want essentially all the time. If you need
     /// a different path use from_hd_wallet_path()
-    pub fn from_phrase(phrase: &str, passphrase: &str) -> Result<PrivateKey, PrivateKeyError> {
+    fn from_phrase(phrase: &str, passphrase: &str) -> Result<CosmosPrivateKey, PrivateKeyError> {
         if phrase.is_empty() {
             return Err(HdWalletError::Bip39Error(Bip39Error::BadWordCount(0)).into());
         }
-        PrivateKey::from_hd_wallet_path("m/44'/118'/0'/0/0", phrase, passphrase)
+        CosmosPrivateKey::from_hd_wallet_path(DEFAULT_COSMOS_HD_PATH, phrase, passphrase)
     }
 
-    pub fn from_hd_wallet_path(
-        path: &str,
+    /// Derives a private key from a mnemonic phrase and passphrase, using a BIP-44 HDPath
+    /// The actual seed bytes are derived from the mnemonic phrase, which are then used to derive
+    /// the root of a Bip32 HD wallet. From that application private keys are derived
+    /// on the given hd_path (e.g. Cosmos' m/44'/118'/0'/0/a where a=0 is the most common value used).
+    /// Most Cosmos wallets do not even expose a=1..n much less the rest of
+    /// the potential key space.
+    fn from_hd_wallet_path(
+        hd_path: &str,
         phrase: &str,
         passphrase: &str,
-    ) -> Result<PrivateKey, PrivateKeyError> {
-        if !path.starts_with('m') || path.contains('\\') {
-            return Err(HdWalletError::InvalidPathSpec(path.to_string()).into());
-        }
-        let mut iterator = path.split('/');
-        // discard the m
-        let _ = iterator.next();
-
-        let key_import = Mnemonic::from_str(phrase)?;
-        let seed_bytes = key_import.to_seed(passphrase);
-        let (master_secret_key, master_chain_code) = master_key_from_seed(&seed_bytes);
-        let mut secret_key = master_secret_key;
-        let mut chain_code = master_chain_code;
-
-        for mut val in iterator {
-            let mut hardened = false;
-            if val.contains('\'') {
-                hardened = true;
-                val = val.trim_matches('\'');
-            }
-            if let Ok(parsed_int) = val.parse() {
-                let (s, c) = get_child_key(secret_key, chain_code, parsed_int, hardened);
-                secret_key = s;
-                chain_code = c;
-            } else {
-                return Err(HdWalletError::InvalidPathSpec(path.to_string()).into());
-            }
-        }
-        Ok(PrivateKey(secret_key))
-    }
-
-    /// Obtain a public key for a given private key
-    pub fn to_public_key(&self, prefix: &str) -> Result<PublicKey, PrivateKeyError> {
-        let secp256k1 = Secp256k1::new();
-        let sk = SecretKey::from_slice(&self.0)?;
-        let pkey = PublicKeyEC::from_secret_key(&secp256k1, &sk);
-        let compressed = pkey.serialize();
-        Ok(PublicKey::from_bytes(compressed, prefix)?)
+    ) -> Result<CosmosPrivateKey, PrivateKeyError> {
+        let secret_key = from_hd_wallet_path(hd_path, phrase, passphrase)?;
+        Ok(CosmosPrivateKey(secret_key))
     }
 
     /// Obtain an Address for a given private key, skipping the intermediate public key
-    pub fn to_address(&self, prefix: &str) -> Result<Address, PrivateKeyError> {
+    fn to_address(&self, prefix: &str) -> Result<Address, PrivateKeyError> {
         let pubkey = self.to_public_key("")?;
         let address = pubkey.to_address_with_prefix(prefix)?;
         Ok(address)
     }
 
-    /// Internal function that that handles building a single message to sign
-    /// returns an internal struct containing the parts of the built transaction
-    /// in a way that's easy to mix and match for various uses and output types.
-    fn build_tx(
-        &self,
-        messages: &[Msg],
-        args: MessageArgs,
-        memo: impl Into<String>,
-    ) -> Result<TxParts, PrivateKeyError> {
-        // prefix does not matter in this case, you could use a blank string
-        let our_pubkey = self.to_public_key(PublicKey::DEFAULT_PREFIX)?;
-        // Create TxBody
-        let body = TxBody {
-            messages: messages.iter().map(|msg| msg.0.clone()).collect(),
-            memo: memo.into(),
-            timeout_height: args.timeout_height,
-            extension_options: Default::default(),
-            non_critical_extension_options: Default::default(),
-        };
-
-        // A protobuf serialization of a TxBody
-        let mut body_buf = Vec::new();
-        body.encode(&mut body_buf).unwrap();
-
-        let key = ProtoSecp256k1Pubkey {
-            key: our_pubkey.to_vec(),
-        };
-
-        let pk_any = encode_any(key, "/cosmos.crypto.secp256k1.PubKey".to_string());
-
-        let single = mode_info::Single { mode: 1 };
-
-        let mode = Some(ModeInfo {
-            sum: Some(mode_info::Sum::Single(single)),
-        });
-
-        let signer_info = SignerInfo {
-            public_key: Some(pk_any),
-            mode_info: mode,
-            sequence: args.sequence,
-        };
-
-        let auth_info = AuthInfo {
-            signer_infos: vec![signer_info],
-            fee: Some(args.fee.into()),
-        };
-
-        // Protobuf serialization of `AuthInfo`
-        let mut auth_buf = Vec::new();
-        auth_info.encode(&mut auth_buf).unwrap();
-
-        let sign_doc = SignDoc {
-            body_bytes: body_buf.clone(),
-            auth_info_bytes: auth_buf.clone(),
-            chain_id: args.chain_id.to_string(),
-            account_number: args.account_number,
-        };
-
-        // Protobuf serialization of `SignDoc`
-        let mut signdoc_buf = Vec::new();
-        sign_doc.encode(&mut signdoc_buf).unwrap();
-
-        let secp256k1 = Secp256k1::new();
-        let sk = SecretKey::from_slice(&self.0)?;
-        let digest = Sha256::digest(&signdoc_buf);
-        let msg = CurveMessage::from_slice(&digest)?;
-        // Sign the signdoc
-        let signed = secp256k1.sign_ecdsa(&msg, &sk);
-        let compact = signed.serialize_compact().to_vec();
-
-        Ok(TxParts {
-            body,
-            body_buf,
-            auth_info,
-            auth_buf,
-            signatures: vec![compact],
-        })
-    }
-
     /// Signs a transaction that contains at least one message using a single
     /// private key, returns the standard Tx type, useful for simulations
-    pub fn get_signed_tx(
+    fn get_signed_tx(
         &self,
         messages: &[Msg],
         args: MessageArgs,
-        memo: impl Into<String>,
+        memo: &str,
     ) -> Result<Tx, PrivateKeyError> {
         let parts = self.build_tx(messages, args, memo)?;
         Ok(Tx {
@@ -236,11 +151,11 @@ impl PrivateKey {
 
     /// Signs a transaction that contains at least one message using a single
     /// private key.
-    pub fn sign_std_msg(
+    fn sign_std_msg(
         &self,
         messages: &[Msg],
         args: MessageArgs,
-        memo: impl Into<String>,
+        memo: &str,
     ) -> Result<Vec<u8>, PrivateKeyError> {
         let parts = self.build_tx(messages, args, memo)?;
 
@@ -259,7 +174,66 @@ impl PrivateKey {
     }
 }
 
-impl FromStr for PrivateKey {
+impl CosmosPrivateKey {
+    /// Obtain a public key for a given private key
+    pub fn to_public_key(&self, prefix: &str) -> Result<CosmosPublicKey, PrivateKeyError> {
+        let secp256k1 = Secp256k1::new();
+        let sk = SecretKey::from_slice(&self.0)?;
+        let pkey = PublicKeyEC::from_secret_key(&secp256k1, &sk);
+        let compressed = pkey.serialize();
+        Ok(CosmosPublicKey::from_bytes(compressed, prefix)?)
+    }
+
+    /// Internal function that that handles building a single message to sign
+    /// returns an internal struct containing the parts of the built transaction
+    /// in a way that's easy to mix and match for various uses and output types.
+    fn build_tx(
+        &self,
+        messages: &[Msg],
+        args: MessageArgs,
+        memo: impl Into<String>,
+    ) -> Result<TxParts, PrivateKeyError> {
+        // prefix does not matter in this case, you could use a blank string
+        let our_pubkey = self.to_public_key(CosmosPublicKey::DEFAULT_PREFIX)?;
+
+        let key = ProtoSecp256k1Pubkey {
+            key: our_pubkey.to_vec(),
+        };
+
+        let mut unfinished = build_unfinished_tx(
+            key,
+            "/cosmos.crypto.secp256k1.PubKey",
+            messages,
+            args.clone(),
+            memo,
+        );
+
+        let sign_doc = SignDoc {
+            body_bytes: unfinished.body_buf.clone(),
+            auth_info_bytes: unfinished.auth_buf.clone(),
+            chain_id: args.chain_id.to_string(),
+            account_number: args.account_number,
+        };
+
+        // Protobuf serialization of `SignDoc`
+        let mut signdoc_buf = Vec::new();
+        sign_doc.encode(&mut signdoc_buf).unwrap();
+
+        let secp256k1 = Secp256k1::new();
+        let sk = SecretKey::from_slice(&self.0)?;
+        let digest = Sha256::digest(&signdoc_buf);
+        let msg = CurveMessage::from_slice(&digest)?;
+        // Sign the signdoc
+        let signed = secp256k1.sign_ecdsa(&msg, &sk);
+        let compact = signed.serialize_compact().to_vec();
+
+        // Finish the TxParts and return
+        unfinished.signatures = vec![compact];
+        Ok(unfinished)
+    }
+}
+
+impl FromStr for CosmosPrivateKey {
     type Err = PrivateKeyError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match hex_str_to_bytes(s) {
@@ -267,20 +241,240 @@ impl FromStr for PrivateKey {
                 if bytes.len() == 32 {
                     let mut inner = [0; 32];
                     inner.copy_from_slice(&bytes[0..32]);
-                    Ok(PrivateKey(inner))
+                    Ok(CosmosPrivateKey(inner))
                 } else {
                     Err(PrivateKeyError::HexDecodeErrorWrongLength)
                 }
             }
             Err(e) => {
                 if contains_non_hex_chars(s) {
-                    PrivateKey::from_phrase(s, "")
+                    CosmosPrivateKey::from_phrase(s, "")
                 } else {
                     Err(e.into())
                 }
             }
         }
     }
+}
+/// This structure represents a private key of an EVM Network.
+#[cfg(feature = "ethermint")]
+#[derive(Debug, Eq, PartialEq, Copy, Clone, Hash)]
+pub struct EthermintPrivateKey([u8; 32]);
+
+#[cfg(feature = "ethermint")]
+impl PrivateKey for EthermintPrivateKey {
+    /// Create a private key using an arbitrary slice of bytes. This function is not resistant to side
+    /// channel attacks and may reveal your secret and private key. It is on the other hand more compact
+    /// than the bip32+bip39 logic.
+    fn from_secret(secret: &[u8]) -> EthermintPrivateKey {
+        EthermintPrivateKey(from_secret(secret))
+    }
+
+    /// This function will take the key_import phrase provided by CosmosCLI
+    /// and import that key. How this is done behind the scenes is quite
+    /// complex. The actual seed bytes from the key_import are used to derive
+    /// the root of a Bip32 HD wallet. From that root Ethereum keys are derived
+    /// on the path m/44'/60'/0'/0/a where a=0 is the most common value used.
+    /// This function returns m/44'/60'/0'/0/0 because that's going to be the key you want
+    /// essentially all the time. If you need a different path use from_hd_wallet_path()
+    fn from_phrase(phrase: &str, passphrase: &str) -> Result<EthermintPrivateKey, PrivateKeyError> {
+        if phrase.is_empty() {
+            return Err(HdWalletError::Bip39Error(Bip39Error::BadWordCount(0)).into());
+        }
+        EthermintPrivateKey::from_hd_wallet_path(DEFAULT_ETHEREUM_HD_PATH, phrase, passphrase)
+    }
+
+    /// Derives a private key from a mnemonic phrase and passphrase, using a BIP-44 HDPath
+    /// The actual seed bytes are derived from the mnemonic phrase, which are then used to derive
+    /// the root of a Bip32 HD wallet. From that application private keys are derived
+    /// on the given hd_path (e.g. Cosmos' m/44'/118'/0'/0/a where a=0 is the most common value used).
+    /// Most Cosmos wallets do not even expose a=1..n much less the rest of
+    /// the potential key space.
+    fn from_hd_wallet_path(
+        hd_path: &str,
+        phrase: &str,
+        passphrase: &str,
+    ) -> Result<EthermintPrivateKey, PrivateKeyError> {
+        let secret_key = from_hd_wallet_path(hd_path, phrase, passphrase)?;
+        Ok(EthermintPrivateKey(secret_key))
+    }
+
+    fn to_address(&self, prefix: &str) -> Result<Address, PrivateKeyError> {
+        let pubkey = self.to_public_key("")?;
+        let address = pubkey.to_address_with_prefix(prefix)?;
+        Ok(address)
+    }
+
+    fn get_signed_tx(
+        &self,
+        messages: &[Msg],
+        args: MessageArgs,
+        memo: &str,
+    ) -> Result<Tx, PrivateKeyError> {
+        let parts = self.build_tx(messages, args, memo)?;
+        Ok(Tx {
+            body: Some(parts.body),
+            auth_info: Some(parts.auth_info),
+            signatures: parts.signatures,
+        })
+    }
+
+    fn sign_std_msg(
+        &self,
+        messages: &[Msg],
+        args: MessageArgs,
+        memo: &str,
+    ) -> Result<Vec<u8>, PrivateKeyError> {
+        let parts = self.build_tx(messages, args, memo)?;
+
+        let tx_raw = TxRaw {
+            body_bytes: parts.body_buf,
+            auth_info_bytes: parts.auth_buf,
+            signatures: parts.signatures,
+        };
+
+        let mut txraw_buf = Vec::new();
+        tx_raw.encode(&mut txraw_buf).unwrap();
+        let digest = Sha256::digest(&txraw_buf);
+        trace!("TXID {}", bytes_to_hex_str(&digest));
+
+        Ok(txraw_buf)
+    }
+}
+
+#[cfg(feature = "ethermint")]
+impl EthermintPrivateKey {
+    fn to_public_key(
+        self,
+        prefix: &str,
+    ) -> Result<crate::public_key::EthermintPublicKey, PrivateKeyError> {
+        let sk = SecretKey::from_slice(&self.0)?;
+        let pkey = SECP256K1.with(move |object| -> Result<_, PrivateKeyError> {
+            let secp256k1 = object.borrow();
+            let pkey = PublicKeyEC::from_secret_key(&secp256k1, &sk);
+            // Serialize the recovered public key in uncompressed format
+            Ok(pkey.serialize())
+        })?;
+        if pkey[1..] == [0x00u8; 64][..] {
+            return Err(PrivateKeyError::ZeroPrivateKey);
+        }
+        let pubkey = crate::public_key::EthermintPublicKey::from_bytes(pkey, prefix)?;
+        Ok(pubkey)
+    }
+
+    /// Internal function that that handles building a single message to sign
+    /// returns an internal struct containing the parts of the built transaction
+    /// in a way that's easy to mix and match for various uses and output types.
+    fn build_tx(
+        &self,
+        messages: &[Msg],
+        args: MessageArgs,
+        memo: impl Into<String>,
+    ) -> Result<TxParts, PrivateKeyError> {
+        let our_pubkey = self.to_public_key(CosmosPublicKey::DEFAULT_PREFIX)?;
+
+        let pubkey_proto = ProtoEthSecp256k1Pubkey {
+            key: our_pubkey.to_vec(),
+        };
+
+        let mut unfinished = build_unfinished_tx(
+            pubkey_proto,
+            "/ethermint.crypto.v1.ethsecp256k1.PubKey",
+            messages,
+            args.clone(),
+            memo,
+        );
+
+        let sign_doc = SignDoc {
+            body_bytes: unfinished.body_buf.clone(),
+            auth_info_bytes: unfinished.auth_buf.clone(),
+            chain_id: args.chain_id.to_string(),
+            account_number: args.account_number,
+        };
+
+        // Protobuf serialization of `SignDoc`
+        let mut signdoc_buf = Vec::new();
+        sign_doc.encode(&mut signdoc_buf).unwrap();
+
+        // Sign the signdoc
+        let clarity_sk = clarity::PrivateKey::from_slice(&self.0).unwrap();
+
+        let signed = clarity_sk.sign_insecure_msg(&signdoc_buf);
+
+        // Finish the TxParts and return
+        unfinished.signatures = vec![signed.to_bytes().to_vec()];
+        Ok(unfinished)
+    }
+}
+
+/// Create a private key using an arbitrary slice of bytes. This function is not resistant to side
+/// channel attacks and may reveal your secret and private key. It is on the other hand more compact
+/// than the bip32+bip39 logic.
+/// Note: This implementation is shared between Ethereum and standard Cosmos SDK chains
+fn from_secret(secret: &[u8]) -> [u8; 32] {
+    let sec_hash = Sha256::digest(secret);
+
+    let mut i = BigUint::from_bytes_be(&sec_hash);
+
+    // Parameters of the curve as explained in https://en.bitcoin.it/wiki/Secp256k1
+    let mut n = BigUint::from_bytes_be(&CurveN);
+    n -= 1u64;
+
+    i %= n;
+    i += 1u64;
+
+    let mut result: [u8; 32] = Default::default();
+    let mut i_bytes = i.to_bytes_be();
+    // key has leading or trailing zero that's not displayed
+    // by default since this is a big int library missing a defined
+    // integer width.
+    while i_bytes.len() < 32 {
+        i_bytes.push(0);
+    }
+    result.copy_from_slice(&i_bytes);
+    result
+}
+
+/// Derives a private key from a mnemonic phrase and passphrase, using a BIP-44 HDPath
+/// The actual seed bytes are derived from the mnemonic phrase, which are then used to derive
+/// the root of a Bip32 HD wallet. From that application private keys are derived
+/// on the given hd_path (e.g. Cosmos' m/44'/118'/0'/0/a where a=0 is the most common value used).
+/// Most Cosmos wallets do not even expose a=1..n much less the rest of
+/// the potential key space.
+/// Note: This implementation is shared between Ethereum and standard Cosmos-SDK chains
+fn from_hd_wallet_path(
+    hd_path: &str,
+    phrase: &str,
+    passphrase: &str,
+) -> Result<[u8; 32], PrivateKeyError> {
+    if !hd_path.starts_with('m') || hd_path.contains('\\') {
+        return Err(HdWalletError::InvalidPathSpec(hd_path.to_string()).into());
+    }
+    let mut iterator = hd_path.split('/');
+    // discard the m
+    let _ = iterator.next();
+
+    let key_import = Mnemonic::from_str(phrase)?;
+    let seed_bytes = key_import.to_seed(passphrase);
+    let (master_secret_key, master_chain_code) = master_key_from_seed(&seed_bytes);
+    let mut secret_key = master_secret_key;
+    let mut chain_code = master_chain_code;
+
+    for mut val in iterator {
+        let mut hardened = false;
+        if val.contains('\'') {
+            hardened = true;
+            val = val.trim_matches('\'');
+        }
+        if let Ok(parsed_int) = val.parse() {
+            let (s, c) = get_child_key(secret_key, chain_code, parsed_int, hardened);
+            secret_key = s;
+            chain_code = c;
+        } else {
+            return Err(HdWalletError::InvalidPathSpec(hd_path.to_string()).into());
+        }
+    }
+    Ok(secret_key)
 }
 
 /// This derives the master key from seed bytes, the actual usage is typically
@@ -363,9 +557,61 @@ fn get_child_key(
     (child_key_res, chain_code_res)
 }
 
+fn build_unfinished_tx<P: prost::Message>(
+    pubkey_proto: P,
+    proto_type_url: &str,
+    messages: &[Msg],
+    args: MessageArgs,
+    memo: impl Into<String>,
+) -> TxParts {
+    // Create TxBody
+    let body = TxBody {
+        messages: messages.iter().map(|msg| msg.0.clone()).collect(),
+        memo: memo.into(),
+        timeout_height: args.timeout_height,
+        extension_options: Default::default(),
+        non_critical_extension_options: Default::default(),
+    };
+
+    // A protobuf serialization of a TxBody
+    let mut body_buf = Vec::new();
+    body.encode(&mut body_buf).unwrap();
+
+    let pk_any = encode_any(pubkey_proto, proto_type_url.to_string());
+
+    let single = mode_info::Single { mode: 1 };
+
+    let mode = Some(ModeInfo {
+        sum: Some(mode_info::Sum::Single(single)),
+    });
+
+    let signer_info = SignerInfo {
+        public_key: Some(pk_any),
+        mode_info: mode,
+        sequence: args.sequence,
+    };
+
+    let auth_info = AuthInfo {
+        signer_infos: vec![signer_info],
+        fee: Some(args.fee.into()),
+    };
+
+    // Protobuf serialization of `AuthInfo`
+    let mut auth_buf = Vec::new();
+    auth_info.encode(&mut auth_buf).unwrap();
+
+    TxParts {
+        body,
+        body_buf,
+        auth_info,
+        auth_buf,
+        signatures: vec![], // Unfinished
+    }
+}
+
 #[test]
 fn test_secret() {
-    let private_key = PrivateKey::from_secret(b"mySecret");
+    let private_key = CosmosPrivateKey::from_secret(b"mySecret");
     assert_eq!(
         private_key.0,
         [
@@ -409,7 +655,7 @@ fn test_cosmos_key_derivation_manual() {
     let (m44h_118h_0h_0_0, _c44h_118h_0h_0_0) =
         get_child_key(m44h_118h_0h_0, c44h_118h_0h_0, 0, false);
 
-    let private_key = PrivateKey(m44h_118h_0h_0_0);
+    let private_key = CosmosPrivateKey(m44h_118h_0h_0_0);
     let public_key = private_key.to_public_key("cosmospub").unwrap();
     let address = public_key.to_address();
     assert_eq!(
@@ -426,7 +672,7 @@ fn test_cosmos_key_derivation_manual() {
 fn test_cosmos_key_derivation_with_path_parsing() {
     let words = "purse sure leg gap above pull rescue glass circle attract erupt can sail gasp shy clarify inflict anger sketch hobby scare mad reject where";
     // now test with automated path parsing
-    let private_key = PrivateKey::from_phrase(words, "").unwrap();
+    let private_key = CosmosPrivateKey::from_phrase(words, "").unwrap();
     let public_key = private_key.to_public_key("cosmospub").unwrap();
     let address = public_key.to_address();
     assert_eq!(
@@ -550,7 +796,7 @@ fn test_many_key_generation() {
     for _ in 0..1000 {
         let mut rng = rand::thread_rng();
         let secret: [u8; 32] = rng.gen();
-        let cosmos_key = PrivateKey::from_secret(&secret);
+        let cosmos_key = CosmosPrivateKey::from_secret(&secret);
         let _cosmos_address = cosmos_key.to_public_key("cosmospub").unwrap().to_address();
     }
 }
@@ -558,6 +804,19 @@ fn test_many_key_generation() {
 #[test]
 // this tests that a bad phrase provides an error
 fn test_bad_phrase() {
-    let cosmos_key = PrivateKey::from_phrase("bad phrase", "");
+    let cosmos_key = CosmosPrivateKey::from_phrase("bad phrase", "");
     assert!(cosmos_key.is_err())
+}
+
+#[cfg(feature = "ethermint")]
+#[test]
+fn test_ethermint_compatibility() {
+    // Test Evmos key:
+    let expected_address = "evmos1zkunj49253lc6wgm0gp5nk8kj2naat0j8fzkfa";
+    // pubkey: '{"@type":"/ethermint.crypto.v1.ethsecp256k1.PubKey","key":"Av7SwLGHN5e+WVuLgYn5rfaBdQ5WlpasMiECekGh/5P0"}'
+    let mnemonic = "whisper unknown entire effort supreme believe supply position noble radar badge check cotton spider affair muffin gold bird trust venue hub core they veteran";
+    let sk = EthermintPrivateKey::from_phrase(mnemonic, "").unwrap();
+    let address = sk.to_address("evmos").unwrap();
+
+    assert_eq!(expected_address, address.to_string())
 }
