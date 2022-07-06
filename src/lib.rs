@@ -38,5 +38,8 @@ pub use msg::Msg;
 pub use private_key::EthermintPrivateKey;
 pub use private_key::MessageArgs;
 pub use private_key::{CosmosPrivateKey, PrivateKey};
+pub use public_key::CosmosPublicKey;
+#[cfg(feature = "ethermint")]
+pub use public_key::EthermintPublicKey;
 pub use public_key::PublicKey;
 pub use signature::Signature;

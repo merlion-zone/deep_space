@@ -83,7 +83,11 @@ pub trait PrivateKey: Clone + Sized {
     ) -> Result<Vec<u8>, PrivateKeyError>;
 }
 
-/// This structure represents a private key of a Cosmos Network.
+/// This structure represents a private key of a Cosmos Network. The default and most common key
+/// type for cosmos-sdk chains is Secp256k1, which is very similar to Ethereum. The /// cosmos-sdk
+/// implementation derives PrivateKeys from mnemonic phrases the same, but PublicKey derivation
+/// differs, see the reference cosmos-sdk implementation here:
+///   https://github.com/cosmos/cosmos-sdk/blob/main/crypto/keys/secp256k1/secp256k1.go#L37-L43
 #[derive(Debug, Eq, PartialEq, Copy, Clone, Hash)]
 pub struct CosmosPrivateKey([u8; 32]);
 
@@ -256,7 +260,12 @@ impl FromStr for CosmosPrivateKey {
         }
     }
 }
-/// This structure represents a private key of an EVM Network.
+/// This structure represents a private key of an EVM Network. This type of key bridges the gap
+/// between the go-ethereum keys implementation Secp256k1 and the expected interfaces in cosmos-sdk.
+/// These PrivateKeys are derived from mnemonic phrases in exactly the same way cosmos-sdk does,
+/// however the derivation of PublicKeys instead matches the Ethereum implementation. See the
+/// reference ethermint implementation here:
+///   https://github.com/evmos/ethermint/blob/main/crypto/ethsecp256k1/ethsecp256k1.go#L63-L74
 #[cfg(feature = "ethermint")]
 #[derive(Debug, Eq, PartialEq, Copy, Clone, Hash)]
 pub struct EthermintPrivateKey([u8; 32]);
