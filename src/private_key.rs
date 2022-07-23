@@ -416,6 +416,31 @@ impl EthermintPrivateKey {
     }
 }
 
+#[cfg(feature = "ethermint")]
+impl FromStr for EthermintPrivateKey {
+    type Err = PrivateKeyError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match hex_str_to_bytes(s) {
+            Ok(bytes) => {
+                if bytes.len() == 32 {
+                    let mut inner = [0; 32];
+                    inner.copy_from_slice(&bytes[0..32]);
+                    Ok(EthermintPrivateKey(inner))
+                } else {
+                    Err(PrivateKeyError::HexDecodeErrorWrongLength)
+                }
+            }
+            Err(e) => {
+                if contains_non_hex_chars(s) {
+                    EthermintPrivateKey::from_phrase(s, "")
+                } else {
+                    Err(e.into())
+                }
+            }
+        }
+    }
+}
+
 /// Create a private key using an arbitrary slice of bytes. This function is not resistant to side
 /// channel attacks and may reveal your secret and private key. It is on the other hand more compact
 /// than the bip32+bip39 logic.

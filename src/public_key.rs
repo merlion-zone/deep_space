@@ -292,6 +292,39 @@ impl FromStr for CosmosPublicKey {
     }
 }
 
+impl FromStr for EthermintPublicKey {
+    type Err = PublicKeyError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Ok(k) = PublicKey::from_bech32(s.to_string()) {
+            Ok(k)
+        } else if let Ok(bytes) = hex_str_to_bytes(s) {
+            if bytes.len() == 33 {
+                let mut inner = [0; 33];
+                inner.copy_from_slice(&bytes[0..33]);
+                PublicKey::from_bytes(inner, EthermintPublicKey::DEFAULT_PREFIX)
+            } else {
+                Err(PublicKeyError::HexDecodeErrorWrongLength)
+            }
+        } else {
+            match base64::decode(s) {
+                Ok(bytes) => {
+                    if bytes.len() == 33 {
+                        let mut inner = [0; 33];
+                        inner.copy_from_slice(&bytes[0..33]);
+                        Ok(PublicKey::from_bytes(
+                            inner,
+                            EthermintPublicKey::DEFAULT_PREFIX,
+                        )?)
+                    } else {
+                        Err(PublicKeyError::BytesDecodeErrorWrongLength)
+                    }
+                }
+                Err(e) => Err(PublicKeyError::Base64DecodeError(e)),
+            }
+        }
+    }
+}
+
 impl Display for CosmosPublicKey {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let display = self.to_bech32(self.get_prefix()).unwrap();
@@ -301,6 +334,20 @@ impl Display for CosmosPublicKey {
 }
 
 impl fmt::Debug for CosmosPublicKey {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.to_bech32(self.get_prefix()).unwrap())
+    }
+}
+
+impl Display for EthermintPublicKey {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let display = self.to_bech32(self.get_prefix()).unwrap();
+        write!(f, "{}", display).expect("Unable to write");
+        Ok(())
+    }
+}
+
+impl fmt::Debug for EthermintPublicKey {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}", self.to_bech32(self.get_prefix()).unwrap())
     }

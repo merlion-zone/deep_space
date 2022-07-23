@@ -10,6 +10,7 @@ use cosmos_sdk_proto::cosmos::auth::v1beta1::{
     query_client::QueryClient as AuthQueryClient, BaseAccount as ProtoBaseAccount,
     QueryAccountRequest,
 };
+use cosmos_sdk_proto::ethermint::types::v1::EthAccount;
 use cosmos_sdk_proto::cosmos::base::tendermint::v1beta1::service_client::ServiceClient as TendermintServiceClient;
 use cosmos_sdk_proto::cosmos::base::tendermint::v1beta1::GetBlockByHeightRequest;
 use cosmos_sdk_proto::cosmos::base::tendermint::v1beta1::GetLatestBlockRequest;
@@ -203,12 +204,14 @@ impl Contact {
                     PeriodicVestingAccount::decode(buf.clone()),
                     ContinuousVestingAccount::decode(buf.clone()),
                     DelayedVestingAccount::decode(buf.clone()),
+                    EthAccount::decode(buf.clone()),
                 ) {
-                    (Ok(d), _, _, _) => Ok(d.get_base_account()),
-                    (_, Ok(d), _, _) => Ok(d.get_base_account()),
-                    (_, _, Ok(d), _) => Ok(d.get_base_account()),
-                    (_, _, _, Ok(d)) => Ok(d.get_base_account()),
-                    (Err(e), _, _, _) => Err(CosmosGrpcError::DecodeError { error: e }),
+                    (Ok(d), _, _, _, _) => Ok(d.get_base_account()),
+                    (_, Ok(d), _, _, _) => Ok(d.get_base_account()),
+                    (_, _, Ok(d), _, _) => Ok(d.get_base_account()),
+                    (_, _, _, Ok(d), _) => Ok(d.get_base_account()),
+                    (_, _, _, _, Ok(d)) => Ok(d.get_base_account()),
+                    (Err(e), _, _, _, _) => Err(CosmosGrpcError::DecodeError { error: e }),
                 }
             }
             Err(e) => match e.code() {

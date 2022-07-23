@@ -1,5 +1,6 @@
 use crate::address::Address;
 use cosmos_sdk_proto::cosmos::auth::v1beta1::BaseAccount as ProtoBaseAccount;
+use cosmos_sdk_proto::ethermint::types::v1::EthAccount;
 use cosmos_sdk_proto::cosmos::vesting::v1beta1::{
     ContinuousVestingAccount, DelayedVestingAccount, PeriodicVestingAccount,
 };
@@ -84,6 +85,15 @@ impl CosmosAccount for BaseAccount {
 impl CosmosAccount for ProtoBaseAccount {
     fn get_base_account(&self) -> BaseAccount {
         self.clone().into()
+    }
+}
+
+impl CosmosAccount for EthAccount {
+    fn get_base_account(&self) -> BaseAccount {
+        return self.base_account
+            .clone()
+            .unwrap()
+            .into()
     }
 }
 
